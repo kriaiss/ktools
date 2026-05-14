@@ -6,13 +6,12 @@
     | . \  | | | |_| || |_| | |___ ___) |
     |_|\_\ |_|  \_____/|____/|____|____/
     </pre>
-
-
+</div>
+<p align="center">
     minimalistic plugin engine for macos.
 
     keep ur workflow clean. manage ur tools. stay on style.
-
-</div>
+</p>
 <p align="center">
     <img src="https://img.shields.io/badge/python-3.12+-blue?style=flat-square" alt="Python">
     <img src="https://img.shields.io/badge/platform-macOS-lightgrey?style=flat-square" alt="Platform">
