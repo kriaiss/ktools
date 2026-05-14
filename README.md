@@ -8,11 +8,10 @@
     </pre>
 
 
-    <p align="center">minimalistic plugin engine for macos.
+    minimalistic plugin engine for macos.
 
     keep ur workflow clean. manage ur tools. stay on style.
-    </p>
-    
+
 </div>
 <p align="center">
     <img src="https://img.shields.io/badge/python-3.12+-blue?style=flat-square" alt="Python">
