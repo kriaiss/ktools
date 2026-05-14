@@ -9,7 +9,6 @@
 </div>
 <p align="center">
     minimalistic plugin engine for macos.
-
     keep ur workflow clean. manage ur tools. stay on style.
 </p>
 <p align="center">
