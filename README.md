@@ -431,4 +431,4 @@ by kriaiss.
 
 ⠀
 
-no, i am sigma 676767676767
+no, by a sigma 676767676767
