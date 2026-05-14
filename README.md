@@ -87,10 +87,6 @@ python3 ktools.py
 
 ⠀
 
-## ure on ur own with the plugins u download. if things go south or ur setup starts acting up, don't look at me! its all on u :3
-
-⠀
-
 # the toolkit (for developers)
 
 read this if u want to use all power of the ktools
