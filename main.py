@@ -229,6 +229,7 @@ def get_theme(is_dark):
     return f"""
     QMenu {{
         background-color: {menu_bg};
+        color: {text};
         border: 1px solid {border};
         border-radius: 8px;
         padding: 5px;
