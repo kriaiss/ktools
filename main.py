@@ -12,6 +12,10 @@ from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+
 class OverlayWindow(QMainWindow):
     def __init__(self, ktools, width=780, height=500):
         super().__init__()
@@ -220,7 +224,7 @@ def get_theme(is_dark):
     item_hover = "rgba(255, 255, 255, 20)" if is_dark else "rgba(0, 0, 0, 10)"
     scroll_handle = "rgba(255, 255, 255, 40)" if is_dark else "rgba(0, 0, 0, 40)"
     scroll_hover = "rgba(255, 255, 255, 70)" if is_dark else "rgba(0, 0, 0, 70)"
-    menu_bg = "rgba(30, 30, 30, 245)" if is_dark else "rgba(245, 245, 245, 245)"
+    menu_bg = "transparent"
     
     return f"""
     QMenu {{
@@ -1323,15 +1327,31 @@ class ktools:
                 except Exception: continue
         return plugin_deps_map
 
+    # i love mac os 27 :) another crash fix
     def setup_tray(self):
         self.tray = QSystemTrayIcon()
         icon = QIcon(os.path.join(os.path.dirname(__file__), "iconTemplate.png"))
         icon.setIsMask(True)
         self.tray.setIcon(icon)
         self.menu = QMenu()
+
+        self.menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.menu.setWindowFlags(self.menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+
+        defaults = NSUserDefaults.standardUserDefaults()
+        is_dark = defaults.stringForKey_("AppleInterfaceStyle") == "Dark" if defaults else True
+        self.menu.setStyleSheet(get_theme(is_dark))
+
         self.refresh_menu()
-        self.tray.setContextMenu(self.menu)
+        
+        self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            apply_liquid_glass(self.menu, radius=8.0)
+            self.refresh_menu()
+            self.menu.popup(QCursor.pos())
 
     def refresh_menu(self):
         self.menu.clear()
