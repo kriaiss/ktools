@@ -1339,10 +1339,6 @@ class ktools:
         self.menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.menu.setWindowFlags(self.menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
 
-        defaults = NSUserDefaults.standardUserDefaults()
-        is_dark = defaults.stringForKey_("AppleInterfaceStyle") == "Dark" if defaults else True
-        self.menu.setStyleSheet(get_theme(is_dark))
-
         self.refresh_menu()
         
         self.tray.activated.connect(self._on_tray_activated)
@@ -1350,7 +1346,13 @@ class ktools:
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
+
+            # update styles on open
+            defaults = NSUserDefaults.standardUserDefaults()
+            is_dark = defaults.stringForKey_("AppleInterfaceStyle") == "Dark" if defaults else True
+            self.menu.setStyleSheet(get_theme(is_dark))
             apply_liquid_glass(self.menu, radius=8.0)
+
             self.refresh_menu()
             self.menu.popup(QCursor.pos())
 
