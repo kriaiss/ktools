@@ -1,20 +1,142 @@
 import gc
-import objgraph
 import zipfile
 import shutil
 import subprocess
 import sys
 import os
 import importlib.util
+import importlib.metadata
 import json
+import re
 
-from PyQt6.QtWidgets import *
-from PyQt6.QtCore import *
-from PyQt6.QtGui import *
+core_deps = [
+    "pyqt6",
+    "pyobjc-core",
+    "pyobjc-framework-cocoa",
+    "pyobjc-framework-quartz",
+    "objgraph"
+]
 
-from PyQt6.QtWidgets import *
-from PyQt6.QtCore import *
-from PyQt6.QtGui import *
+base_deps = [
+    "pip",
+    "setuptools",
+    "wheel"
+]
+
+class SecurityError(Exception):
+    pass
+
+def normalize_name(name):
+    return re.sub(r"[-_.]+", "-", str(name)).strip().lower()
+
+# pyobjc dumps 150+ frameworks
+def is_system_package(name):
+    norm = normalize_name(name)
+    if norm in {normalize_name(p) for p in core_deps + base_deps} or norm == "objgraph":
+        return True
+    if norm.startswith("pyqt6") or norm.startswith("pyobjc") or norm == "objc":
+        return True
+    return False
+
+# walk the requirements tree so sub-deps dont get deleted
+def resolve_transitive_dependencies(root_packages):
+    all_needed = set()
+    queue = list(root_packages)
+    while queue:
+        item = queue.pop(0)
+        norm = normalize_name(item)
+        if norm in all_needed:
+            continue
+        all_needed.add(norm)
+        try:
+            reqs = importlib.metadata.requires(item) or []
+            for r in reqs:
+                if "extra ==" in r:
+                    continue
+                clean_r = re.split(r"[; \(\)><=!~\[]", r)[0].strip()
+                if clean_r:
+                    norm_dep = normalize_name(clean_r)
+                    if norm_dep not in all_needed:
+                        queue.append(clean_r)
+        except Exception:
+            pass
+    return all_needed
+
+def get_installed_distributions():
+    pkgs = {}
+    try:
+        for dist in importlib.metadata.distributions():
+            name = dist.metadata.get("Name")
+            if name:
+                pkgs[normalize_name(name)] = name
+    except Exception:
+        pass
+    return pkgs
+
+def get_missing_core_dependencies():
+    installed = get_installed_distributions()
+    missing = []
+    for dep in core_deps:
+        if normalize_name(dep) not in installed:
+            missing.append(dep)
+    return missing
+
+def get_all_plugin_dependencies(plugins_dir):
+    needed = set()
+    if not os.path.isdir(plugins_dir):
+        return needed
+    for name in os.listdir(plugins_dir):
+        p_dir = os.path.join(plugins_dir, name)
+        if not os.path.isdir(p_dir):
+            continue
+        inf_file = os.path.join(p_dir, "inf.json")
+        if os.path.isfile(inf_file):
+            try:
+                with open(inf_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    deps = data.get("dependencies", [])
+                    if isinstance(deps, list):
+                        for d in deps:
+                            d_clean = str(d).strip()
+                            if d_clean and d_clean.lower() != "no deps":
+                                needed.add(d_clean)
+            except Exception:
+                pass
+    return needed
+
+def ensure_dependencies_headless():
+    missing_core = get_missing_core_dependencies()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    plugins_dir = os.path.join(base_dir, "plugins")
+    plugin_deps = get_all_plugin_dependencies(plugins_dir)
+    installed = get_installed_distributions()
+    missing_plugins = [p for p in plugin_deps if normalize_name(p) not in installed]
+    all_missing = missing_core + [p for p in missing_plugins if p not in missing_core]
+    if not all_missing:
+        return
+    print(f"ktools: missing dependencies detected: {all_missing}")
+    print("ktools: launching headless dependency manager...")
+    cmd = [sys.executable, "-m", "pip", "install"] + all_missing
+    if sys.prefix == sys.base_prefix:
+        cmd.extend(["--user", "--break-system-packages"])
+    res = subprocess.run(cmd)
+    if res.returncode != 0:
+        print("ktools: failed to install required dependencies")
+        sys.exit(1)
+    print("ktools: dependencies installed, starting engine...")
+    importlib.invalidate_caches()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+ensure_dependencies_headless()
+
+try:
+    import objgraph
+    from PyQt6.QtWidgets import *
+    from PyQt6.QtCore import *
+    from PyQt6.QtGui import *
+except ImportError as err:
+    print(f"ktools: fatal import error: {err}")
+    sys.exit(1)
 
 class OverlayWindow(QMainWindow):
     def __init__(self, ktools, width=780, height=500):
@@ -302,6 +424,8 @@ class KToast(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        # kill toast native window resources on close
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         self.setFixedSize(400, 40)
         
@@ -354,6 +478,7 @@ class KToast(QWidget):
                 self.manager_list.remove(self)
         except ValueError:
             pass
+        self.deleteLater()
         super().closeEvent(event)
 
     def update_theme(self):
@@ -410,8 +535,10 @@ class LogStream:
 
 
 class InstallWorker(QThread):
-    finished = pyqtSignal(list)
-    
+    package_started = pyqtSignal(str, int, int)
+    package_finished = pyqtSignal(str, bool)
+    finished = pyqtSignal(list, list)
+
     def __init__(self, dep_mgr, packages):
         super().__init__()
         self.dep_mgr = dep_mgr
@@ -419,21 +546,24 @@ class InstallWorker(QThread):
 
     def run(self):
         installed_pkgs = []
-        for pkg in self.packages:
-            print(f"dependency manager: installing: {pkg}")
+        failed_pkgs = []
+        total = len(self.packages)
+        for idx, pkg in enumerate(self.packages):
+            self.package_started.emit(pkg, idx + 1, total)
+            print(f"dependency manager: installing ({idx + 1}/{total}): {pkg}")
             cmd = self.dep_mgr.pip_cmd + ["install", pkg]
-            
             if sys.prefix == sys.base_prefix:
                 cmd.extend(["--user", "--break-system-packages"])
-
             res = subprocess.run(cmd, capture_output=True, text=True)
-            
             if res.returncode == 0:
                 installed_pkgs.append(pkg)
+                self.package_finished.emit(pkg, True)
             else:
+                failed_pkgs.append(pkg)
+                self.package_finished.emit(pkg, False)
                 print(f"dependency manager: failed to install {pkg}: {res.stderr}")
-        
-        self.finished.emit(installed_pkgs)
+        self.finished.emit(installed_pkgs, failed_pkgs)
+
 
 
 class PluginCard(QPushButton):
@@ -591,11 +721,27 @@ class PluginManager(OverlayWindow):
         self.nav_hbox.addWidget(self.import_btn)
         self.nav_hbox.addWidget(self.reload_btn)
 
+        self.progress_container = QWidget()
+        self.progress_layout = QVBoxLayout(self.progress_container)
+        self.progress_layout.setContentsMargins(10, 0, 10, 5)
+        self.progress_layout.setSpacing(4)
+        
+        self.progress_status_label = QLabel("")
+        self.progress_status_label.setObjectName("InstallStatusLabel")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("InstallProgress")
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(4)
+        
+        self.progress_layout.addWidget(self.progress_status_label)
+        self.progress_layout.addWidget(self.progress_bar)
+        self.progress_container.hide()
+
         self.outer_vbox.addWidget(self.content_area)
+        self.outer_vbox.addWidget(self.progress_container)
         self.outer_vbox.addLayout(self.nav_hbox)
 
         self.setCentralWidget(self.root)
-
 
         self.plugin_group = QButtonGroup(self)
         self.plugin_group.setExclusive(True)
@@ -603,6 +749,24 @@ class PluginManager(OverlayWindow):
         self.is_hiding = False
         self.installEventFilter(self)
         self.update_theme()
+
+    def show_install_progress(self, total):
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(0)
+        self.progress_status_label.setText("checking dependencies...")
+        self.progress_container.show()
+        self.import_btn.setEnabled(False)
+        self.reload_btn.setEnabled(False)
+
+    def update_install_progress(self, pkg_name, current, total):
+        self.progress_bar.setValue(current - 1)
+        self.progress_status_label.setText(f"installing {pkg_name} ({current}/{total})...")
+
+    def hide_install_progress(self):
+        self.progress_container.hide()
+        self.import_btn.setEnabled(True)
+        self.reload_btn.setEnabled(True)
+
 
     def plugin_nav_wheel_event(self, event):
         delta = event.angleDelta()
@@ -878,8 +1042,17 @@ class PluginManager(OverlayWindow):
         deps_layout = QVBoxLayout(self.tab_deps)
         deps_layout.setContentsMargins(10, 0, 0, 0)
         
+        deps_header = QHBoxLayout()
         deps_title = QLabel("dependency manager")
         deps_title.setObjectName("PluginTitle")
+        deps_header.addWidget(deps_title)
+        deps_header.addStretch()
+
+        self.clean_deps_btn = QPushButton("clean unused")
+        self.clean_deps_btn.setObjectName("ActionBtn")
+        self.clean_deps_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clean_deps_btn.clicked.connect(self.handle_clean_unused_deps)
+        deps_header.addWidget(self.clean_deps_btn)
         
         self.deps_list_scroll = QScrollArea()
         self.deps_list_scroll.setWidgetResizable(True)
@@ -891,7 +1064,7 @@ class PluginManager(OverlayWindow):
         self.deps_list_vbox.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.deps_list_scroll.setWidget(self.deps_list_container)
         
-        deps_layout.addWidget(deps_title)
+        deps_layout.addLayout(deps_header)
         deps_layout.addWidget(self.deps_list_scroll)
 
         self.tab_about = self._create_settings_info("about", "ktools engine v1.0.1\ndeveloped by kriaiss\ncake is a lie\n\nminimalistic plugin api and manager for macos\n\n>you are entirely on your own with the third-party plugins you download or create.\nif a poorly written script hangs your system or your setup starts acting up,\ndon't look at me! it's all on you. :3")
@@ -976,45 +1149,117 @@ class PluginManager(OverlayWindow):
         l.addStretch()
         return w
 
+    def handle_clean_unused_deps(self):
+        self.ktools.dep_mgr.cleanup_unused()
+        self.refresh_deps_tab()
+        self.ktools.notify("unused packages cleaned")
+
     def refresh_deps_tab(self):
         self._clear_layout(self.deps_list_vbox)
 
-        data = self.ktools.dep_mgr._get_data()
-        installed_via_ktools = data.get("installed_packages", [])
-        system_libs = self.ktools.dep_mgr.ktools_core_libs
-        
-        if not installed_via_ktools:
-            lbl = QLabel("no external packages in inst.json")
+        plugin_deps_map = self.ktools.dep_mgr.get_plugin_dependencies_map()
+        direct_plugin_deps = set()
+        for deps in plugin_deps_map.values():
+            for d in deps:
+                direct_plugin_deps.add(normalize_name(d))
+
+        all_plugin_needed = resolve_transitive_dependencies(direct_plugin_deps)
+
+        installed = get_installed_distributions()
+
+        items_to_display = []
+        seen = set()
+
+        # hide 150 background pyobjc frameworks
+        primary_core = ["pyqt6", "pyobjc-framework-cocoa", "pyobjc-framework-quartz"]
+        for c in primary_core:
+            norm = normalize_name(c)
+            if norm in installed and norm not in seen:
+                seen.add(norm)
+                items_to_display.append({
+                    "name": installed[norm].lower(),
+                    "real_name": installed[norm],
+                    "status": "core",
+                    "can_delete": False
+                })
+
+        for p in sorted(direct_plugin_deps):
+            norm = normalize_name(p)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if norm in installed:
+                items_to_display.append({
+                    "name": installed[norm].lower(),
+                    "real_name": installed[norm],
+                    "status": "in use",
+                    "can_delete": True
+                })
+            else:
+                items_to_display.append({
+                    "name": p.lower(),
+                    "real_name": p,
+                    "status": "missing",
+                    "can_delete": False
+                })
+
+        for norm, real_name in sorted(installed.items()):
+            if norm in seen or is_system_package(norm):
+                continue
+            if norm not in all_plugin_needed:
+                seen.add(norm)
+                items_to_display.append({
+                    "name": real_name.lower(),
+                    "real_name": real_name,
+                    "status": "unused",
+                    "can_delete": True
+                })
+
+        items_to_display.sort(key=lambda x: x["name"])
+
+        if not items_to_display:
+            lbl = QLabel("no external plugin packages installed")
             lbl.setObjectName("DetailsText")
             lbl.setStyleSheet("margin-top: 10px; opacity: 0.5;")
             self.deps_list_vbox.addWidget(lbl)
             return
 
-        for pkg in sorted(installed_via_ktools):
+        for item in items_to_display:
             row_widget = QWidget()
             row = QHBoxLayout(row_widget)
             row.setContentsMargins(0, 4, 10, 4)
-            
-            lbl = QLabel(pkg.lower())
+
+            display_text = item["name"]
+            if item["status"] == "unused":
+                display_text = f"{item['name']} (unused)"
+            elif item["status"] == "missing":
+                display_text = f"{item['name']} (missing)"
+
+            lbl = QLabel(display_text)
             lbl.setObjectName("DetailsText")
-            
             row.addWidget(lbl)
             row.addStretch()
 
-            if pkg.lower() not in system_libs:
+            if item["can_delete"]:
                 del_btn = QPushButton("delete")
                 del_btn.setFixedSize(60, 22)
                 del_btn.setObjectName("ActionBtn")
                 del_btn.setStyleSheet("color: #ff4444; font-size: 10px; border-color: rgba(255,68,68,40);")
-                del_btn.clicked.connect(lambda ch, p=pkg: self.uninstall_package(p))
+                del_btn.clicked.connect(lambda ch, p=item["real_name"]: self.uninstall_package(p))
                 row.addWidget(del_btn)
-            
+
             self.deps_list_vbox.addWidget(row_widget)
 
     def uninstall_package(self, pkg_name):
+        norm = normalize_name(pkg_name)
+        if is_system_package(norm) and norm in {normalize_name(p) for p in core_deps}:
+            print(f"dependency manager: cannot uninstall core dependency: {pkg_name}")
+            self.ktools.notify(f"cannot remove core: {pkg_name}")
+            return
         print(f"dependency manager: manual uninstall: {pkg_name}")
         cmd = self.ktools.dep_mgr.pip_cmd + ["uninstall", "-y", pkg_name]
         subprocess.run(cmd, capture_output=True)
+        importlib.invalidate_caches()
         self.refresh_deps_tab()
         self.ktools.notify(f"removed {pkg_name}")
 
@@ -1052,6 +1297,22 @@ class PluginManager(OverlayWindow):
             QPushButton#BottomNavBtn:checked {{ color: {text}; border-bottom: 2px solid {text}; }}
             
             QLabel#DetailsText {{ color: {st}; font-family: 'Menlo'; font-size: 13px; }}
+
+            QProgressBar#InstallProgress {{
+                border: none;
+                border-radius: 2px;
+                background: {btn};
+                height: 4px;
+            }}
+            QProgressBar#InstallProgress::chunk {{
+                background: {text};
+                border-radius: 2px;
+            }}
+            QLabel#InstallStatusLabel {{
+                color: {st};
+                font-family: 'Menlo';
+                font-size: 11px;
+            }}
         """
 
     def event(self, event):
@@ -1101,26 +1362,45 @@ class PluginManager(OverlayWindow):
             plugins_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "plugins"))
             
             with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                for member in zip_ref.namelist():
-                    extracted_path = os.path.abspath(os.path.join(plugins_dir, member))
-                    if not extracted_path.startswith(plugins_dir):
-                        raise SecurityError("Attempted Path Traversal in Zip File")
-                
-                top_level_dirs = {name.split('/')[0] for name in zip_ref.namelist() if '/' in name}
+                names = zip_ref.namelist()
+                top_level_dirs = {name.split('/')[0] for name in names if '/' in name}
                 
                 if not top_level_dirs:
-                    self.ktools.notify("warning: flat zip structure")
+                    folder_name = os.path.splitext(os.path.basename(file_path))[0]
+                    target_dir = os.path.abspath(os.path.join(plugins_dir, folder_name))
+                    if not target_dir.startswith(plugins_dir):
+                        raise SecurityError("Attempted Path Traversal in Zip File")
 
-                for folder in top_level_dirs:
-                    full_path = os.path.join(plugins_dir, folder)
-                    if os.path.exists(full_path):
-                        print(f"ktools: cleaning up existing plugin: {folder}")
-                        shutil.rmtree(full_path)
+                    for member in names:
+                        extracted_path = os.path.abspath(os.path.join(target_dir, member))
+                        if not extracted_path.startswith(target_dir):
+                            raise SecurityError("Attempted Path Traversal in Zip File")
 
-                zip_ref.extractall(plugins_dir)
-                self.ktools.notify(f"imported: {', '.join(top_level_dirs)}")
+                    if os.path.exists(target_dir):
+                        print(f"ktools: cleaning up existing plugin: {folder_name}")
+                        shutil.rmtree(target_dir)
 
-            QTimer.singleShot(500, self.ktools.reload_all)
+                    os.makedirs(target_dir, exist_ok=True)
+                    zip_ref.extractall(target_dir)
+                    imported_names = [folder_name]
+                else:
+                    for member in names:
+                        extracted_path = os.path.abspath(os.path.join(plugins_dir, member))
+                        if not extracted_path.startswith(plugins_dir):
+                            raise SecurityError("Attempted Path Traversal in Zip File")
+
+                    for folder in top_level_dirs:
+                        full_path = os.path.join(plugins_dir, folder)
+                        if os.path.exists(full_path):
+                            print(f"ktools: cleaning up existing plugin: {folder}")
+                            shutil.rmtree(full_path)
+
+                    zip_ref.extractall(plugins_dir)
+                    imported_names = list(top_level_dirs)
+
+                self.ktools.notify(f"imported: {', '.join(imported_names)}")
+
+            self.ktools.dep_mgr.check_and_install_missing(on_done=self.ktools.reload_all)
             
         except Exception as e:
             self.ktools.notify("import error")
@@ -1130,130 +1410,119 @@ class PluginManager(OverlayWindow):
 class DependencyManager:
     def __init__(self, ktools_instance):
         self.ktools = ktools_instance
-        self.pip_cmd = self._find_pip()
+        self.pip_cmd = [sys.executable, "-m", "pip"]
         self.is_installing = False
-        self.ktools_core_libs = {
-            "pyqt6", "pyobjc", "pyobjc-core", "pyobjc-framework-appkit", 
-            "pyobjc-framework-cocoa", "pyobjc-framework-foundation", "objc", "objgraph"
-        }
+        self.worker = None
 
-    def install_missing_manual(self, to_install):
-        if self.is_installing or not to_install: return
-        self.is_installing = True
+    def get_plugin_dependencies_map(self):
+        plugin_deps_map = {}
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        p_dir = os.path.join(base_path, "plugins")
+        if not os.path.exists(p_dir):
+            return {}
+        for name in os.listdir(p_dir):
+            inf_path = os.path.join(p_dir, name, "inf.json")
+            if os.path.exists(inf_path):
+                try:
+                    with open(inf_path, "r", encoding="utf-8") as f:
+                        inf = json.load(f)
+                        deps = inf.get("dependencies", [])
+                        if isinstance(deps, list):
+                            clean = [str(d).strip() for d in deps if str(d).strip() and str(d).lower() != "no deps"]
+                            plugin_deps_map[name] = clean
+                except Exception:
+                    continue
+        return plugin_deps_map
 
-        print(f"dependency manager: starting installation of: {to_install}")
-        self.ktools.notify(f"installing {len(to_install)} packages...")
-
-        self.worker = InstallWorker(self, to_install)
-        self.worker.finished.connect(self._on_install_finished)
-        self.worker.start()
-
-    def _get_data(self):
-        path = self.ktools._get_inst_path()
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception: pass
-        return {}
-
-    def _find_pip(self):
-        bin_dir = os.path.join(sys.prefix, "bin")
-
-        for pip_name in ["pip3", "pip"]:
-            pip_path = os.path.join(bin_dir, pip_name)
-            if os.path.exists(pip_path):
-                return [pip_path]
-
-        for cmd in [sys.executable, 'pip3', 'pip']:
-            try:
-                if cmd == sys.executable:
-                    return [cmd, '-m', 'pip']
-                else:
-                    subprocess.run([cmd, '--version'], capture_output=True)
-                    return [cmd]
-            except Exception: continue
-        return None
-
-    def is_package_installed(self, pkg_name):
-        import importlib.metadata
-        try:
-            importlib.metadata.version(pkg_name)
-            return True
-        except importlib.metadata.PackageNotFoundError:
-            return False
-
-    def install_missing(self):
-        if not self.pip_cmd or self.is_installing: return
-        
-        data = self._get_data()
-        installed_via_ktools = set(data.get("installed_packages", []))
-        to_install = []
-        for deps in data.get("plugin_deps", {}).values():
-            for d in deps:
-                d_low = d.lower()
-                if d_low not in self.ktools_core_libs and d_low not in installed_via_ktools and not self.is_package_installed(d_low):
-                    to_install.append(d_low)
-
-        to_install = list(set(to_install))
-
-        if not to_install: return
-
-        self.is_installing = True
-        self.ktools.notify("installing dependencies...")
-
-        self.worker = InstallWorker(self, to_install)
-        self.worker.finished.connect(self._on_install_finished)
-        self.worker.start()
-
-    def _on_install_finished(self, installed_pkgs):
-        self.is_installing = False
-        
-        if installed_pkgs:
-            data = self._get_data()
-            current_installed = set(data.get("installed_packages", []))
-            for pkg in installed_pkgs:
-                current_installed.add(pkg.lower())
-            
-            data["installed_packages"] = sorted(list(current_installed))
-            with open(self.ktools._get_inst_path(), "w", encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-
-            import importlib
-            importlib.invalidate_caches()
-            print(f"dependency manager: {len(installed_pkgs)} pkgs installed. reloading plugins...")
-
-            QTimer.singleShot(500, self.ktools.reload_all)
-            
-            if len(installed_pkgs) < len(self.worker.packages):
-                self.ktools.notify("some deps failed, but others installed")
-        else:
-            print("dependency manager: nothing was installed")
-            self.ktools.notify("install failed")
-
-    def cleanup_unused(self):
-        if not self.pip_cmd: return
-        
-        data = self._get_data()
-        installed_via_ktools = set(p.lower() for p in data.get("installed_packages", []))
-
-        needed_now = set()
-        deps_map = self.ktools.pre_scan_dependencies()
+    def get_all_plugin_dependencies(self):
+        deps_map = self.get_plugin_dependencies_map()
+        all_deps = set()
         for deps in deps_map.values():
             for d in deps:
-                needed_now.add(d.lower().strip())
+                all_deps.add(d)
+        return all_deps
 
-        unused = installed_via_ktools - needed_now - self.ktools_core_libs
-        
-        if unused:
-            print(f"dependency manager: physical uninstalling: {unused}")
-            cmd = self.pip_cmd + ["uninstall", "-y"] + list(unused)
-            res = subprocess.run(cmd, capture_output=True)
-            
+    def get_missing_plugin_dependencies(self):
+        all_deps = self.get_all_plugin_dependencies()
+        installed = get_installed_distributions()
+        missing = []
+        for d in all_deps:
+            if normalize_name(d) not in installed:
+                missing.append(d)
+        return sorted(list(set(missing)))
+
+    def is_package_installed(self, pkg_name):
+        installed = get_installed_distributions()
+        return normalize_name(pkg_name) in installed
+
+    def check_and_install_missing(self, on_done=None):
+        missing = self.get_missing_plugin_dependencies()
+        if not missing:
+            if on_done:
+                on_done()
+            return
+        self.install_packages(missing, on_done=on_done)
+
+    def install_packages(self, to_install, on_done=None):
+        if self.is_installing or not to_install:
+            if on_done:
+                on_done()
+            return
+        self.is_installing = True
+        print(f"dependency manager: starting installation of: {to_install}")
+        self.ktools.notify(f"installing {len(to_install)} dependencies...")
+
+        if hasattr(self.ktools, "manager"):
+            self.ktools.manager.show_install_progress(len(to_install))
+
+        self.worker = InstallWorker(self, to_install)
+        if hasattr(self.ktools, "manager"):
+            self.worker.package_started.connect(self.ktools.manager.update_install_progress)
+        self.worker.finished.connect(lambda installed, failed: self._on_install_finished(installed, failed, on_done))
+        self.worker.start()
+
+    def _on_install_finished(self, installed_pkgs, failed_pkgs, on_done):
+        self.is_installing = False
+        importlib.invalidate_caches()
+        if hasattr(self.ktools, "manager"):
+            self.ktools.manager.hide_install_progress()
+        if installed_pkgs:
+            print(f"dependency manager: {len(installed_pkgs)} pkgs installed")
+        if failed_pkgs:
+            print(f"dependency manager: failed to install: {failed_pkgs}")
+            self.ktools.notify(f"failed to install: {', '.join(failed_pkgs)}")
+        if on_done:
+            on_done()
+
+    def cleanup_unused(self):
+        if sys.prefix == sys.base_prefix:
+            print("dependency manager: outside venv, skipping cleanup")
+            return
+
+        installed_map = get_installed_distributions()
+        protected = {normalize_name(p) for p in core_deps + base_deps}
+        plugin_deps = self.get_all_plugin_dependencies()
+
+        root_needed = list(protected) + list(plugin_deps)
+        all_needed = resolve_transitive_dependencies(root_needed)
+
+        unused_to_uninstall = []
+        for norm_name, real_name in installed_map.items():
+            # never uninstall system packages during cleanup
+            if is_system_package(norm_name):
+                continue
+            if norm_name not in all_needed:
+                unused_to_uninstall.append(real_name)
+
+        if unused_to_uninstall:
+            print(f"dependency manager: aggressive cleanup of unused packages: {unused_to_uninstall}")
+            cmd = self.pip_cmd + ["uninstall", "-y"] + unused_to_uninstall
+            res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode == 0:
-                data["installed_packages"] = sorted(list(installed_via_ktools - unused))
-                with open(self.ktools._get_inst_path(), "w", encoding='utf-8') as f:
-                    json.dump(data, f, indent=4, ensure_ascii=False)
+                print("dependency manager: cleanup finished")
+            else:
+                print(f"dependency manager: cleanup error: {res.stderr}")
+            importlib.invalidate_caches()
 
 
 class ktools:
@@ -1304,29 +1573,25 @@ class ktools:
         
         QTimer.singleShot(500, self.manager.toggle)
 
+        self.cleanup_timer = QTimer(self.app)
+        self.cleanup_timer.timeout.connect(self._run_maintenance)
+        self.cleanup_timer.start(300000)
+
         self.reload_all()
         print("ktools: engine started")
 
+    # OMG ram balloons to space
+    def _run_maintenance(self):
+        try:
+            import objc
+            with objc.autorelease_pool():
+                pass
+        except Exception:
+            pass
+        gc.collect()
+
     def pre_scan_dependencies(self):
-        plugin_deps_map = {}
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        p_dir = os.path.join(base_path, "plugins")
-        
-        if not os.path.exists(p_dir): 
-            return {}
-        
-        for name in os.listdir(p_dir):
-            inf_path = os.path.join(p_dir, name, "inf.json")
-            if os.path.exists(inf_path):
-                try:
-                    with open(inf_path, "r", encoding='utf-8') as f:
-                        inf = json.load(f)
-                        deps = inf.get("dependencies", [])
-                        if isinstance(deps, list):
-                            clean = [d.strip().lower() for d in deps if d.strip() and d.lower() != "no deps"]
-                            plugin_deps_map[name] = clean
-                except Exception: continue
-        return plugin_deps_map
+        return self.dep_mgr.get_plugin_dependencies_map()
 
     # i love mac os 27 :) another crash fix
     def setup_tray(self):
@@ -1417,29 +1682,26 @@ class ktools:
 
         for p in list(self.plugins.values()):
             try:
-                if hasattr(p, 'unload'): p.unload()
-            except Exception: pass
+                if hasattr(p, 'unload'):
+                    p.unload()
+            except Exception:
+                pass
         self.plugins.clear()
+
+        missing = self.dep_mgr.get_missing_plugin_dependencies()
+        if missing and not self.dep_mgr.is_installing:
+            print(f"ktools: missing dependencies: {missing}")
+            self.dep_mgr.install_packages(missing, on_done=self._finish_reload)
+            return
+
+        self._finish_reload()
+
+    def _finish_reload(self):
         self.load_plugins()
-
-        deps_map = self.pre_scan_dependencies()
-        
-        installed_via_ktools = set(self.dep_mgr._get_data().get("installed_packages", []))
-        to_install = []
-        for p_name, deps in deps_map.items():
-            for d in deps:
-                d_low = d.lower().strip()
-                if d_low not in self.dep_mgr.ktools_core_libs and d_low not in installed_via_ktools and not self.dep_mgr.is_package_installed(d_low):
-                    print(f"ktools: missing dependency '{d_low}' for plugin '{p_name}'")
-                    to_install.append(d_low)
-        
-        if to_install:
-            self.dep_mgr.install_missing_manual(list(set(to_install)))
-
-        self.update_inst_json(external_deps=deps_map)
         self.refresh_menu()
         if hasattr(self, 'manager'):
             self.manager.refresh_list()
+            self.manager.refresh_deps_tab()
             
         self.is_reloading = False
 
@@ -1453,25 +1715,6 @@ class ktools:
 
         print(f"ktools: reload finished. plugins: {len(self.plugins)}")
         self.notify("plugins reloaded")
-
-    def _get_inst_path(self):
-        return os.path.join(os.path.dirname(__file__), "inst.json")
-
-    def update_inst_json(self, external_deps=None):
-        inst_path = self._get_inst_path()
-        plugin_deps_map = external_deps if external_deps is not None else self.pre_scan_dependencies()
-
-        old_data = self.dep_mgr._get_data()
-        previously_installed = set(old_data.get("installed_packages", []))
-        
-        data = {
-            "installed_packages": sorted(list(previously_installed)), 
-            "plugin_deps": plugin_deps_map,
-            "system_scan_time": QDateTime.currentDateTime().toString(Qt.DateFormat.ISODate)
-        }
-
-        with open(inst_path, "w", encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
 
     def notify(self, text):
         toast = KToast(text, self.active_toasts)
@@ -1523,36 +1766,42 @@ class ktools:
             if hasattr(target_win, 'hide_anim'): target_win.hide_anim()
             else: target_win.hide()
         else:
-            self.is_switching = True
-            QTimer.singleShot(600, self._release_switching)
-            
-            try:
-                ws = NSWorkspace.sharedWorkspace()
-                active = ws.frontmostApplication()
-                if active and active.processIdentifier() != os.getpid():
-                    self.last_active_app = active
-            except Exception:
-                pass
-                
             closed_other = False
             if target_layer == 'overlay':
-                for name, plugin in self.plugins.items():
-                    if name == plugin_name: continue
-                    layer = getattr(plugin, 'layer', 'overlay')
-                    if layer == 'overlay':
-                        win = getattr(plugin, 'shell', getattr(plugin, 'window', getattr(plugin, 'monitor', None)))
-                        if win and win.isVisible():
-                            if hasattr(win, 'hide_anim'): win.hide_anim()
-                            else: win.hide()
-                            closed_other = True
-                            
-                if plugin_name != "kmanager" and self.manager.isVisible():
-                    self.manager.hide()
-                    closed_other = True
+                closed_other = self.request_show(plugin_name)
 
             delay = 120 if closed_other else 0
             is_ov = (target_layer == 'overlay')
             QTimer.singleShot(delay, lambda: self._execute_show(target_win, is_overlay=is_ov))
+
+    def request_show(self, plugin_name):
+        self.is_switching = True
+        QTimer.singleShot(600, self._release_switching)
+        
+        try:
+            ws = NSWorkspace.sharedWorkspace()
+            active = ws.frontmostApplication()
+            if active and active.processIdentifier() != os.getpid():
+                self.last_active_app = active
+        except Exception:
+            pass
+            
+        closed_other = False
+        for name, plugin in self.plugins.items():
+            if name == plugin_name: continue
+            layer = getattr(plugin, 'layer', 'overlay')
+            if layer == 'overlay':
+                win = getattr(plugin, 'shell', getattr(plugin, 'window', getattr(plugin, 'monitor', None)))
+                if win and win.isVisible():
+                    if hasattr(win, 'hide_anim'): win.hide_anim()
+                    else: win.hide()
+                    closed_other = True
+                    
+        if plugin_name != "kmanager" and hasattr(self, 'manager') and self.manager.isVisible():
+            self.manager.hide()
+            closed_other = True
+
+        return closed_other
 
     def _execute_show(self, target_win, is_overlay=True):
         if is_overlay:
@@ -1659,7 +1908,6 @@ class ktools:
                     pid = self.last_active_app.processIdentifier()
                     
                     if self._app_has_windows_on_current_space(pid):
-                        # focus drops here, had to hack in NSApplicationActivateIgnoringOtherApps
                         self.last_active_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
                     else:
                         for app in ws.runningApplications():
@@ -1722,8 +1970,8 @@ class ktools:
                 return
 
         self.notify(f"plugin {plugin_id} removed")
+        self.dep_mgr.cleanup_unused()
         self.reload_all()
-        QTimer.singleShot(1000, self.dep_mgr.cleanup_unused)
 
     def isolate_plugin_crash(self, plugin_id, error_msg):
         print(f"ktools: isolating crash in plugin {plugin_id}")
